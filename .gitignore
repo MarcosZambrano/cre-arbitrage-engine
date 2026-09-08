@@ -1,0 +1,17 @@
+# Secrets - never commit. .env holds EMAIL / APP_NAME / APP_PASSWORD.
+.env
+.env.*
+!.env.example
+
+# Local notes and scratch work
+CLAUDE.md
+brainstorm.txt
+test.py
+
+# Python virtual environment (51 MB of platform-specific binaries)
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

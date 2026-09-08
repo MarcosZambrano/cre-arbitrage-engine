@@ -1,0 +1,41 @@
+# ==========================================
+# Commercial Real Estate Arbitrage Engine
+# Configuration Schema
+# ==========================================
+
+# Target Market & Search Criteria
+search:
+  target_location: "Dallas, TX"
+  property_type: "Industrial" # Options: Office, Retail, Industrial, Flex,
+                              # Coworking, Medical, Land, Restaurant, Lab
+  max_pages: 10              # Safety cap for pagination loop
+
+# Financial & Valuation Thresholds
+filters:
+  arbitrage_threshold_pct: 20.0  # Alert if property is >= 20% below submarket median
+  min_square_feet: 25000         # Filter out properties below 25,000 SF
+  max_annual_budget: 500000.0    # Maximum annual rent commitment ($)
+
+# Browser & System Execution Settings
+browser:
+  debug_port: 9222
+  host: "127.0.0.1"
+  # Target URL for initial navigation
+  target_url: "https://www.loopnet.com/"
+  
+  # Platform-specific paths (handled dynamically in python)
+  windows:
+    chrome_path: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    profile_dir: "C:\\selenium\\loopnet-chrome"
+  linux:
+    chrome_path: "/usr/bin/google-chrome"
+    profile_dir: "/tmp/loopnet-chrome"
+
+# Email Alert Dispatcher Settings (SMTP)
+# Note: Sensitive secrets (passwords) should be pulled from OS Environment Variables
+smtp:
+  server: "smtp.gmail.com"
+  port: 587
+  use_tls: true
+  sender_email: "your-automated-alert@gmail.com"
+  recipient_email: "investor-team@yourdomain.com"

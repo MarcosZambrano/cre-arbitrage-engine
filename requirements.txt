@@ -1,0 +1,12 @@
+# Python 3.14
+# Install:  pip install -r requirements.txt
+
+# Browser automation. Selenium Manager (bundled since 4.6) resolves a matching
+# chromedriver automatically, so no driver binary is needed here.
+selenium==4.48.0
+
+# Reads .env for EMAIL / APP_NAME / APP_PASSWORD (see .env.example).
+python-dotenv==1.2.3
+
+# Parses config.yaml.
+PyYAML==6.0.3
