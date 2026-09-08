@@ -43,21 +43,37 @@ So the wait is passive. `wait_for_challenge_via_devtools()` polls Chrome's
 reports tab titles **without opening a CDP session**. Only once the title reads `LoopNet` does
 Selenium attach.
 
-## Navigation is the dangerous operation
+## Navigation restarts the browser
 
 The same failure applies to every page load, not just the first:
 
-> Any navigation performed while ChromeDriver is attached re-runs the challenge under an active CDP
-> session, fails it, and burns the profile.
+> Any navigation performed in a browser ChromeDriver has attached to re-runs the challenge under an
+> active CDP session, fails it, and burns the profile.
 
 Interacting with an already-loaded page is fine — clicking, reading, typing. It is specifically
 *navigation* that fails.
 
-This produced a confusing symptom: the scraper worked once, then never again. After a successful
-run the URL had become `/search/...`, so an exact `current_url != URL` comparison fired a
-`driver.get()` reload on the next run, which burned the profile. The guard is now a host check
-(`"loopnet.com" not in current_url`), and since Chrome is launched with the URL already, a cold
-start navigates nothing.
+Crucially, **the taint outlives `driver.quit()`**. Ending the Selenium session and then navigating
+over the DevTools HTTP endpoint still gets Access Denied. Three measurements pin this down:
+
+| Sequence | Result |
+|---|---|
+| Chrome launched at the URL, never attached | loads |
+| Attached, `quit()`, then navigate without CDP | **Access Denied** |
+| Attached, `quit()`, kill Chrome, relaunch **same profile** at the URL | loads |
+
+The third line is the important one: the *profile* is not tainted, only the live browser session.
+So `BrowserManager.navigate()` restarts Chrome on the target URL, waits for the challenge passively,
+and re-attaches — reusing the same profile and its cookies throughout.
+
+It costs roughly 20–30 seconds per navigation. That is the price of the only sequence that works,
+and it is why the scraper builds a filtered results URL instead of clicking through the UI: each
+avoided page load is one fewer relaunch and one fewer chance to burn the profile.
+
+This also produced a confusing symptom earlier: the scraper worked once, then never again. After a
+successful run the URL had become `/search/...`, so an exact `current_url != URL` comparison fired a
+`driver.get()` reload on the next run. The guard is now a host check
+(`"loopnet.com" not in current_url`).
 
 ## Burned profiles, and recovery
 
@@ -109,16 +125,36 @@ Two related traps in that widget:
   `"property-type-icons"`. Clicking that hits the carousel's centre, which is why every property
   type selected the same tile. The predicate form `[.//p[...]]` selects the tile itself.
 
-## The open blocker
+## Searching by URL, not by the form
 
-Submitting the location search navigates to `/search/<type>-space/<location>/for-lease/`, and that
-navigation returns `Access Denied` — for the reason in
-[Navigation is the dangerous operation](#navigation-is-the-dangerous-operation).
+The search is issued as a URL rather than by filling in the homepage form, because the form's
+submit — and the filter panel's Search button — are navigations, and
+[navigations restart the browser](#navigation-restarts-the-browser). Driving the UI would mean
+paying a relaunch per interaction and hitting the bot wall at the final click.
 
-The URL itself is fine. Opening exactly the same URL with **no** Selenium session attached — via a
-`PUT` to `/json/new` on the DevTools endpoint — loads the results page normally
-(`Dallas Industrial Spaces for Lease | LoopNet`).
+`LoopNetScraper.search_url()` builds the address directly:
 
-The fix is to generalise what already works for the first page load: end the Selenium session,
-navigate the browser without CDP, wait passively for the challenge, then re-attach and scrape. Every
-navigation — search submission, pagination, opening a listing — needs to go through that path.
+```
+https://www.loopnet.com/search/industrial-space/dallas-tx/for-lease/
+    ?max-rent=500000&min-space-size=25000
+```
+
+This removes the homepage round-trip, the property-type click and the location typeahead, taking the
+run from two navigations to one.
+
+### The location slug
+
+LoopNet uses two different separators, both verified live:
+
+| Input | Slug | Rule |
+|---|---|---|
+| `Dallas, TX` | `dallas-tx` | US: single dash + two-letter state code |
+| `San Francisco, California` | `san-francisco-ca` | full state names are mapped to codes |
+| `Paris, France` | `paris--france` | international: **double** dash + country |
+| `Austin` | `austin` | no region given |
+
+`location_slug()` implements this, stripping accents via `unicodedata` so `Zürich` becomes `zurich`.
+
+Non-US coverage is LoopNet's own limitation, not a slug bug: `paris--france` and `berlin--germany`
+resolve, while `london--united-kingdom`, `toronto--canada` and `milan--italy` return 404 under every
+spelling tried. `search()` detects a 404 title and says so rather than scraping an error page.

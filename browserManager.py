@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from dotenv import load_dotenv
@@ -24,13 +25,9 @@ URL = "https://www.loopnet.com/"
 DEBUG_HOST = "127.0.0.1"
 DEBUG_PORT = 9222
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-# The default profile. If Akamai burns it, run() rotates to a fresh timestamped
-# directory automatically - point this at the new one to skip that cycle on the
-# next cold start.
 # Every profile lives under this root. delete_profile() refuses to touch anything
 # outside it, so a bad profile_dir cannot turn into a stray recursive delete.
 PROFILE_ROOT = r"C:\selenium"
-PROFILE_DIR = os.path.join(PROFILE_ROOT, "loopnet-20260908-132343")
 
 class BrowserManager:
     def __init__(self):
@@ -42,9 +39,9 @@ class BrowserManager:
         # here would create a local variable inside __init__ and leave the module
         # constant untouched, so --fresh silently did nothing.
         if "--fresh" in sys.argv:
-            self.profile_dir = rf"C:\selenium\loopnet-{datetime.now():%Y%m%d-%H%M%S}"
+            self.profile_dir = self.new_profile_dir()
         else:
-            self.profile_dir = PROFILE_DIR
+            self.profile_dir = self.latest_profile_dir() or self.new_profile_dir()
 
 
     def port_is_open(self, host=DEBUG_HOST, port=DEBUG_PORT):
@@ -56,7 +53,7 @@ class BrowserManager:
             return False
 
 
-    def start_chrome(self):
+    def start_chrome(self, url=URL):
         """Launch Chrome detached, so it outlives this script and keeps its cookies."""
         if not os.path.exists(CHROME_PATH):
             raise SystemExit(f"Chrome not found at {CHROME_PATH}")
@@ -71,7 +68,7 @@ class BrowserManager:
             # instead of the URL, and the browser never reaches LoopNet.
             "--no-first-run",
             "--no-default-browser-check",
-            URL,
+            url,
         ]
 
         # DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB stop Chrome from being killed
@@ -114,7 +111,13 @@ class BrowserManager:
             # one gets straight through, so rotate and retry once instead of dying
             # and making the user remember a flag.
             print(f"Profile {self.profile_dir} is burned - rotating to a fresh one.")
-            burned = self.profile_dir
+            burned = self.running_profile_dir() or self.profile_dir
+
+            # Kill by the profile the browser is ACTUALLY using, not by
+            # self.profile_dir. When the port was already open we inherited
+            # someone else's browser, so those two can differ - and killing the
+            # wrong one left the burned browser alive, whereupon launch_and_attach
+            # cheerfully reattached to it and reported the fresh profile as blocked.
             self.close_chrome_for_profile(burned)
             self.wait_for_port_to_close()
 
@@ -139,6 +142,49 @@ class BrowserManager:
     @staticmethod
     def new_profile_dir():
         return os.path.join(PROFILE_ROOT, f"loopnet-{datetime.now():%Y%m%d-%H%M%S}")
+
+    @staticmethod
+    def latest_profile_dir():
+        """Most recently used profile under PROFILE_ROOT, or None if there are none.
+
+        Rotation deletes a burned profile and creates a timestamped replacement, so
+        any hardcoded default goes stale the first time a profile is burned - which
+        cost a pointless rotate-and-relaunch cycle on every cold start. Picking the
+        newest directory keeps the warm profile in use without anything to maintain.
+        """
+        try:
+            candidates = [
+                os.path.join(PROFILE_ROOT, name)
+                for name in os.listdir(PROFILE_ROOT)
+                if name.startswith("loopnet-")
+                and os.path.isdir(os.path.join(PROFILE_ROOT, name))
+            ]
+        except OSError:
+            return None
+        return max(candidates, key=os.path.getmtime) if candidates else None
+
+    @staticmethod
+    def running_profile_dir():
+        """The --user-data-dir of the Chrome currently holding the debug port.
+
+        Needed because an already-running browser may have been started by an
+        earlier run with a different profile than this instance is configured for.
+        """
+        script = (
+            "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+            f"Where-Object {{ $_.CommandLine -like '*--remote-debugging-port={DEBUG_PORT}*' }} | "
+            "ForEach-Object { if ($_.CommandLine -match '--user-data-dir=([^\" ]+)') "
+            "{ $matches[1]; break } }"
+        )
+        try:
+            done = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, text=True, timeout=20,
+            )
+            found = done.stdout.strip().splitlines()
+            return found[0].strip() if found else None
+        except Exception:
+            return None
 
     @staticmethod
     def delete_profile(profile_dir):
@@ -218,6 +264,85 @@ class BrowserManager:
             capture_output=True,
         )
 
+    def navigate(self, url, timeout=90):
+        """Load `url` by restarting Chrome on it, then re-attach Selenium.
+
+        Akamai rejects any navigation made in a browser that ChromeDriver has
+        attached to - and the taint outlives driver.quit(), so detaching first is
+        not enough. What does work is a page loaded by a browser that has never
+        been driven: Chrome launched directly at the URL passes every time.
+
+        The profile itself is not tainted, only the live browser session, so the
+        same profile (and its cookies) is reused across relaunches.
+
+        Costs roughly 20-30s per navigation, which is the price of the only
+        sequence that survives the bot wall.
+        """
+        if getattr(self, "driver", None) is not None:
+            self.driver.quit()
+            self.driver = None
+
+        self.close_chrome_for_profile(self.running_profile_dir() or self.profile_dir)
+        self.wait_for_port_to_close()
+
+        self.start_chrome(url)
+        if not self.wait_for_port():
+            raise SystemExit(f"Chrome did not reopen {DEBUG_HOST}:{DEBUG_PORT}")
+
+        deadline = time.time() + timeout
+        title = ""
+        while time.time() < deadline:
+            titles = self.devtools_page_titles()
+            title = titles[0] if titles else ""
+            if any("Access Denied" in t for t in titles):
+                raise SystemExit(
+                    f"Blocked by Akamai while loading {url}. "
+                    "Re-run to rotate to a clean profile."
+                )
+            # While the challenge runs the title is the bare host, "loopnet.com".
+            if title and title != "loopnet.com":
+                break
+            time.sleep(1)
+        else:
+            raise SystemExit(f"{url} never settled (last title: {title!r})")
+
+        self.attach()
+        # Right after attaching, driver.title can come back empty for a beat.
+        settle = time.time() + 10
+        while time.time() < settle and not (self.driver.title or ""):
+            time.sleep(0.5)
+        return self.driver
+
+    def close_other_tabs(self):
+        """Close every tab except the one currently focused."""
+        keep = self.driver.current_window_handle
+        for handle in self.driver.window_handles:
+            if handle != keep:
+                self.driver.switch_to.window(handle)
+                self.driver.close()
+        self.driver.switch_to.window(keep)
+
+    def focus_tab(self, url):
+        """Point the re-attached driver at the tab showing `url`."""
+        marker = urllib.parse.urlparse(url).path or url
+        for handle in self.driver.window_handles:
+            self.driver.switch_to.window(handle)
+            if marker in (self.driver.current_url or ""):
+                return True
+        return False
+
+    def devtools_target_title(self, target_id):
+        """Title of one specific DevTools target, read without a CDP session."""
+        try:
+            url = f"http://{DEBUG_HOST}:{DEBUG_PORT}/json/list"
+            raw = urllib.request.urlopen(url, timeout=5).read()
+            for target in json.loads(raw):
+                if target.get("id") == target_id:
+                    return target.get("title", "")
+        except Exception:
+            pass
+        return ""
+
     def devtools_page_titles(self):
         """Tab titles read passively from the DevTools HTTP endpoint (no CDP session)."""
         try:
@@ -246,6 +371,16 @@ class BrowserManager:
         while time.time() < deadline and self.port_is_open():
             time.sleep(0.5)
 
+    def attach(self):
+        """Attach Selenium to the Chrome already listening on the debug port."""
+        chrome_options = webdriver.ChromeOptions()
+        chrome_options.add_experimental_option("debuggerAddress", f"{DEBUG_HOST}:{DEBUG_PORT}")
+        try:
+            self.driver = webdriver.Chrome(options=chrome_options)
+        except WebDriverException as err:
+            raise SystemExit(f"Could not attach to Chrome.\n\nOriginal error: {err}")
+        return self.driver
+
     def launch_and_attach(self):
         """Ensure Chrome is running on the debug port, then attach Selenium to it."""
         if self.port_is_open():
@@ -273,13 +408,7 @@ class BrowserManager:
 
         # --- 2. Attach to it ---------------------------------------------------------
 
-        chrome_options = webdriver.ChromeOptions()
-        chrome_options.add_experimental_option("debuggerAddress", f"{DEBUG_HOST}:{DEBUG_PORT}")
-
-        try:
-            self.driver = webdriver.Chrome(options=chrome_options)
-        except WebDriverException as err:
-            raise SystemExit(f"Could not attach to Chrome.\n\nOriginal error: {err}")
+        self.attach()
 
         # Navigate only if we are not already somewhere on loopnet.com.
         #
@@ -288,7 +417,9 @@ class BrowserManager:
         # while ChromeDriver is attached is what burns the profile: the challenge
         # re-runs under an active CDP session and fails. Chrome is launched with
         # the URL already, so on a cold start there is nothing to navigate to.
-        if "loopnet.com" not in self.driver.current_url:
+        # current_url is None for a moment right after attaching to a
+        # freshly launched browser, so guard it.
+        if "loopnet.com" not in (self.driver.current_url or ""):
             self.driver.get(URL)
 
     def wait_for_real_page(self, timeout=45):

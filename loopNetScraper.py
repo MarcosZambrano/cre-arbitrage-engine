@@ -1,94 +1,206 @@
-import os
-import socket
-import subprocess
-import sys
-import time
-from datetime import datetime
-from dotenv import load_dotenv
+import re
+import unicodedata
+import urllib.parse
+import pprint
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import (
-    StaleElementReferenceException,
-    TimeoutException,
-    WebDriverException,
-)
+from selenium.common.exceptions import TimeoutException
 
 from configManager import ConfigManager
+
+HOMEPAGE = "https://www.loopnet.com/"
+
+# LoopNet slugs a US location as "city-state" using the two-letter code, but an
+# international one as "city--country" with a DOUBLE dash. Both forms verified
+# live: dallas-tx, new-york-ny, paris--france, berlin--germany.
+US_STATES = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
+    "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
+    "district of columbia": "dc", "florida": "fl", "georgia": "ga", "hawaii": "hi",
+    "idaho": "id", "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm", "new york": "ny",
+    "north carolina": "nc", "north dakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhode island": "ri",
+    "south carolina": "sc", "south dakota": "sd", "tennessee": "tn", "texas": "tx",
+    "utah": "ut", "vermont": "vt", "virginia": "va", "washington": "wa",
+    "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy",
+}
+US_STATE_CODES = set(US_STATES.values())
+
+SIZE_RE = re.compile(r"([\d,]+)(?:\s*-\s*([\d,]+))?\s*SF") # Regex 
+
+def parse_sf(text):
+
+    """ Return (sf_min, sf_max) from a card's size line, or (None, None).
+    int("64,533") raises, so the commas are stripped first. When there is no
+    range, sf_max is set equal to sf_min - that way every listing carries both
+    values and callers never have to check which form it was.
+    """
+
+    match = SIZE_RE.search(text)
+
+    if not match:
+
+        return None, None
+
+    low = int(match.group(1).replace(",", ""))
+
+    high = int(match.group(2).replace(",", "")) if match.group(2) else low
+
+    return low, high
+
+def slugify(text):
+    """Lowercase ASCII slug; strips accents, joins words with single dashes."""
+    text = unicodedata.normalize("NFKD", str(text))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = re.sub(r"[^a-zA-Z0-9]+", " ", text).strip().lower()
+    return "-".join(text.split())
+
+
+def location_slug(location):
+    """Turn a human location into LoopNet's URL segment.
+
+    "Dallas, TX"                -> dallas-tx        (US: one dash + state code)
+    "San Francisco, California" -> san-francisco-ca (full state name accepted)
+    "Paris, France"             -> paris--france    (international: TWO dashes)
+    "Austin"                    -> austin           (no region given)
+    """
+    parts = [part.strip() for part in str(location).split(",") if part.strip()]
+    if not parts:
+        return ""
+
+    city = slugify(parts[0])
+    if len(parts) == 1:
+        return city
+
+    # Use the last part, so "Brooklyn, New York, NY" resolves its region as NY.
+    region = parts[-1]
+    key = slugify(region).replace("-", " ")
+
+    if key in US_STATE_CODES:
+        return f"{city}-{key}"
+    if key in US_STATES:
+        return f"{city}-{US_STATES[key]}"
+    return f"{city}--{slugify(region)}"
+
 
 class LoopNetScraper:
     # One tile per property type: Office, Retail, Industrial, Flex, Coworking,
     # Medical, Land, Restaurant, Lab. The last two sit outside the visible
-    # carousel window.
+    # carousel window. Only used by select_property_type(), which the URL-driven
+    # search no longer needs - kept as a way to validate a config value.
     PROPERTY_TYPE_TILE = "div.property-type-icons div.property-type"
 
-    def __init__(self, driver: webdriver.Chrome, config: ConfigManager):
+    def __init__(self, driver: webdriver.Chrome, config: ConfigManager, browser=None):
         self.driver = driver
         self.config = config
+        # BrowserManager, needed for navigation. Every page load has to go through
+        # browser.navigate(), which relaunches Chrome on the target URL.
+        self.browser = browser
 
-        # --- 4. Find the search bar --------------------------------------------------
-        #
-        # Two inputs are named "geography"; the first is the visible one
-        # (placeholder "Enter a location"), the second is hidden.
+    def search_url(self):
+        """Build the results URL, filters included, that the search form would produce.
+
+        e.g. "Industrial" + "Dallas, TX" + min 25000 SF becomes
+        https://www.loopnet.com/search/industrial-space/dallas-tx/for-lease/?min-space-size=25000
+
+        Filtering through the URL rather than the filter panel is not merely
+        tidier: the panel ends in a Search button click, and that click is a
+        navigation, which Akamai rejects in any browser ChromeDriver has attached.
+        """
+        property_type = slugify(self.config.property_type)
+        location = location_slug(self.config.location)
+
+        # Both values are cast to int: max_annual_budget is a float in YAML, and
+        # "500000.0" is not valid in the query string.
+        params = {}
+        if self.config.max_annual_budget:
+            params["max-rent"] = int(self.config.max_annual_budget)
+        if self.config.min_square_feet:
+            params["min-space-size"] = int(self.config.min_square_feet)
+
+        url = (
+            "https://www.loopnet.com/search/"
+            f"{property_type}-space/{location}/for-lease/"
+        )
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        return url
 
     def search(self):
-        wait = WebDriverWait(self.driver, 10)
-
-
         print("\nFilters for the search: ")
         print(f"1. Max annual price for the search: {self.config.max_annual_budget}")
         print(f"2. Minimum square feet: {self.config.min_square_feet}")
         print(f"3. Property type desired: {self.config.property_type}")
         print(f"4. Location: {self.config.location}")
 
-        # Selecting the wanted property_type (parameters that comes from config.yaml)
-        self.select_property_type()
+        # One navigation, straight to the filtered results. The homepage visit,
+        # the property-type click and the geography typeahead are all unnecessary
+        # now that the URL encodes the property type - and since every page load
+        # costs a Chrome relaunch, halving them halves the chance of a burn.
+        url = self.search_url()
+        print(f"\nSearching: {url}")
+        self.driver = self.browser.navigate(url)
 
-        geography_input = wait.until(
-            EC.visibility_of_element_located(
-                (By.NAME, "geography")
+        title = self.driver.title or ""
+        if "404" in title or "Page Not Found" in title:
+            raise SystemExit(
+                f"LoopNet has no results page for {self.config.location!r} "
+                f"(slug: {location_slug(self.config.location)}).\n"
+                "Coverage outside the US is partial: France, Germany and Spain "
+                "resolve, while the UK, Canada and Italy return 404."
             )
-        )
 
-        # Type the location to search:
-        geography_input.send_keys(f"{self.config.location}")
+        print(f"Results page: {title}")
 
-        # Press ENTER to start the search.
-        geography_input.send_keys(Keys.ENTER)
-        print("Clicked the basic search button")
+    def scrape_listing_cards(self):
+        listings = []
+        """ This function takes a listing from a website and extracts the listing cards from it."""
 
-        wait = WebDriverWait(self.driver, 10)
+        # listing_price = self.driver.find_elements(By.CSS_SELECTOR, "li[name='Price']")
+        # listings_prices = [price.text for price in listing_price]
+        # print(f"Listings prices: {listings_prices}")
 
-        # We are going add some filters so that only the listing cards that are between a range of values are shown (This allows us to perform less pagination)
-        filters_element = wait.until(
-            EC.visibility_of_element_located(
-                (By.XPATH, "//*[@id='quickSearchFilters']/div[2]/div[13]/button/span[1]")
-            )
-        )
+        # listing_sizes = self.driver.find_elements(By.XPATH, "//ul[contains(@class,'data-points')]"
+        #     "/li[contains(., ' SF') and not(contains(., '/YR'))]")
+        # sizes = [parse_sf(size.text) for size in listing_sizes]
+        # print(f"Listings sizes {sizes}")
 
-        filters_element.click()
 
-        wait = WebDriverWait(self.driver, 10)
+        # listings_urls = self.driver.find_element(By.CSS_SELECTOR, "h4 a").get_attribute("href")
+        # print(f"Listings urls: {listings_urls}")
 
-        # Getting the Maximum Annual Rate Element and sending the configuration value to it.
-        max_annual_rate_element = wait.until(
-            EC.visibility_of_element_located(
-                (By.XPATH, "//*[@id='top']/section[1]/div[3]/div[2]/div/click-event-bridge/section/form/div[4]/section[3]/div/section[1]/div[1]/div[1]/div/div[3]/input")
-            )
-        )
-        max_annual_rate_element.send_keys(f"{self.config.max_annual_budget}")
+        cards_elements = self.driver.find_elements(By.CSS_SELECTOR, "article.placard")
+        for card in cards_elements:
+            listing_price = card.find_element(By.CSS_SELECTOR, "li[name='Price']").text
+            listing_size = parse_sf(card.find_element(By.XPATH, "//ul[contains(@class,'data-points')]").text)
+            listing_url = card.find_element(By.CSS_SELECTOR, "h4 a").get_attribute("href")
 
-        # Getting the Minimum Space Range in SF (Square Foot)
-        min_square_feet = self.driver.find_element(By.XPATH, "//*[@id='top']/section[1]/div[3]/div[2]/div/click-event-bridge/section/form/div[4]/section[3]/div/section[1]/div[5]/div[1]/div/div[1]/input")
-        min_square_feet.send_keys(self.config.min_square_feet)
+            listings.append({
+                "price": listing_price,
+                "size": listing_size,
+                "property_type": self.config.property_type,
+                "url": listing_url
+            })
 
-        search_button = self.driver.find_element(By.XPATH, "//*[@id='top']/section[1]/div[3]/div[2]/div/click-event-bridge/div/button[2]")
-        search_button.click()
+        print("Listings present for the search:\n\n")
+        pprint.pprint(listings)
+
+        return listings
+
 
     def select_property_type(self):
+        """Click the property-type tile on the HOMEPAGE matching the config value.
 
+        No longer part of search(), which encodes the type in the URL instead.
+        Kept because it is the only check that a config property_type actually
+        exists on the site.
+        """
         # Labels of every property-type tile, in the order the page lists them.
         tiles = self.driver.find_elements(By.CSS_SELECTOR, self.PROPERTY_TYPE_TILE)
         # .text is empty here: the <p> labels are visually hidden, so the rendered
@@ -99,7 +211,6 @@ class LoopNetScraper:
             for tile in tiles
         ]
 
-        #Click the property-type tile matching `property_type` (config by default)."""
         wanted = self.config.property_type
 
         # The predicate form [.//p[...]] selects the TILE itself. Using
@@ -134,5 +245,3 @@ class LoopNetScraper:
             lambda drv: "selected" in (tile.get_attribute("class") or "")
         )
         print(f"Property type selected: {wanted}")
-
-        

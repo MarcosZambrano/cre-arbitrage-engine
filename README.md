@@ -4,9 +4,9 @@ Automated system for identifying undervalued commercial real estate listings on 
 It monitors target submarkets, computes a live median rate per ZIP code, and alerts on listings
 priced below a configurable discount threshold.
 
-> **Status: early development.** The browser access layer and configuration are working. Data
-> extraction, valuation and alerting are not built yet, and results-page navigation is currently
-> blocked by LoopNet's anti-bot protection.
+> **Status: early development.** The browser access layer, configuration and filtered search are
+> working - the scraper reaches a filtered results page. Data extraction, valuation and alerting
+> are not built yet.
 >
 > See [ROADMAP.md](ROADMAP.md) for module status and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 > for how the browser layer works.
@@ -42,8 +42,8 @@ Then edit `config.yaml`:
 python main.py
 ```
 
-Chrome starts on a persistent profile, waits for the anti-bot challenge to clear, attaches Selenium
-and selects the configured property type. Running again reuses the browser that is already open.
+Chrome starts on a persistent profile, waits for the anti-bot challenge to clear, then loads the
+filtered results URL built from `config.yaml`.
 
 If a profile gets blocked, the program detects it, deletes it and rotates to a clean one
 automatically — no flag needed.
@@ -51,8 +51,11 @@ automatically — no flag needed.
 ## Current limitations
 
 - **Windows only.** Process management uses Win32 creation flags and PowerShell.
-- **Results-page navigation is blocked.** Submitting the location search returns Access Denied.
-  Diagnosed but unfixed — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#the-open-blocker).
+- **Each navigation costs a Chrome relaunch (~25s).** Akamai rejects page loads made in a browser
+  ChromeDriver has attached to, so every navigation restarts the browser on the target URL — see
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#navigation-restarts-the-browser).
+- **Non-US coverage is partial.** France, Germany and Spain resolve; the UK, Canada and Italy
+  return 404 from LoopNet itself.
 - **No data extraction yet.** Nothing is parsed, valued or emailed.
 
 ## Note
