@@ -7,7 +7,7 @@
 CLAUDE.md
 brainstorm.txt
 test.py
-
+notes.py
 # Python virtual environment (51 MB of platform-specific binaries)
 venv/
 .venv/
@@ -15,3 +15,5 @@ venv/
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+
