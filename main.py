@@ -12,7 +12,8 @@ loopNetScraper = LoopNetScraper(driver=browserManager.driver, config=config, bro
 loopNetScraper.search()
 listings = loopNetScraper.scrape_listing_cards()
 
-valuationEngine = ValuationEngine(listings=listings)
-valuationEngine.calculate_valuation()
-
+valuationEngine = ValuationEngine(listings=listings, config=config)
+baseline, type_of_baseline = valuationEngine.calculate_baseline()
+valuationEngine.calculate_arbitrage_listing(baseline)
+valuationEngine.alert_threshold()
 

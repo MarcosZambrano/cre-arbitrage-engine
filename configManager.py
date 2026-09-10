@@ -17,4 +17,4 @@ class ConfigManager:
         self.min_square_feet = self.config["filters"]["min_square_feet"]
         self.property_type = self.config["search"]["property_type"]
         self.location = self.config["search"]["target_location"]
-                
+        self.arbitrage_threshold_pct = self.config["filters"]["arbitrage_threshold_pct"]     

@@ -181,11 +181,16 @@ class LoopNetScraper:
             listing_size = parse_sf(card.find_element(By.XPATH, "//ul[contains(@class,'data-points')]").text)
             listing_url = card.find_element(By.CSS_SELECTOR, "h4 a").get_attribute("href")
 
+            listing_price_num = float(listing_price.replace("$", "").replace("SF/YR", "").strip())
+            # print("Listing price number ready for calculations: ", listing_price_num)
+            listing_size_min = float(listing_size[0])
+
             listings.append({
                 "price": listing_price,
                 "size": listing_size,
                 "property_type": self.config.property_type,
-                "url": listing_url
+                "url": listing_url,
+                "annual_total_rent_projection": listing_price_num * listing_size_min, # We are choosing the minimum size for the listing card.
             })
 
         print("Listings present for the search:\n\n")
