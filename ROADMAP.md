@@ -1,7 +1,7 @@
 # Roadmap
 
-Target architecture is six modules (full specification kept locally in `CLAUDE.md`).
-Two are done, two are partial.
+**The pipeline is complete and runs end to end:** config → browser → filtered search → card
+extraction → valuation → email alert.
 
 ## Module status
 
@@ -9,77 +9,66 @@ Two are done, two are partial.
 |---|---|---|
 | `ConfigManager` | ✅ Done | Reads `config.yaml` + `.env`. Exposes `max_annual_budget`, `min_square_feet`, `property_type`, `location`, `arbitrage_threshold_pct`. |
 | `BrowserManager` | ✅ Done | Chrome lifecycle, Selenium attachment, anti-bot handling, profile rotation. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
-| `LoopNetScraper` | 🟡 Partial | Loads a filtered results URL. `scrape_listing_cards()` extracts price, size, URL and property type per card, parses the rate, and projects annual rent. ZIP, address and brokerage not captured yet. |
-| `Listing` | ❌ Not started | Card data is still plain dicts. |
-| `ValuationEngine` | 🟡 Partial | Median baseline with a confidence tag, arbitrage delta per listing, and a threshold check. Baseline is one median for the whole search, not per ZIP; alert checks the delta only. |
-| `NotificationDispatcher` | ❌ Not started | `alert_threshold()` prints a placeholder where the dispatch call will go. |
+| `LoopNetScraper` | ✅ Done | Builds a filtered results URL; `scrape_listing_cards()` returns price, size range, URL, property type and a projected annual rent per card. |
+| `ValuationEngine` | ✅ Done | Median rate baseline with a confidence tag, arbitrage delta per listing, threshold check that hands qualifying listings to the dispatcher. |
+| `NotificationDispatcher` | ✅ Done | Gmail SMTP over STARTTLS, one formatted alert email per qualifying listing. |
+| `Listing` | ⚪ Not built | Deliberately skipped — cards stay plain dicts. See scope decisions. |
 
-### What `ValuationEngine` does today
+## How the valuation works
 
-- **`calculate_baseline()`** — median of every listing's rate. Returns a confidence tag alongside
-  it: `HIGH` with 5 or more samples, `LOW` with fewer, `NO_DATA` with none.
-- **`calculate_arbitrage_listing(baseline)`** — adds `arbitrage_delta_percentage` to each card,
-  `Δ = (1 - R_i / M) × 100`. Positive means cheaper than the median.
-- **`alert_threshold()`** — flags cards where `Δ ≥ arbitrage_threshold_pct`.
+- **`calculate_baseline()`** — the median rate across every listing returned by the search, plus a
+  confidence tag: `HIGH` at 5 or more samples, `LOW` below that, `NO_DATA` when none parsed.
+- **`calculate_arbitrage_listing()`** — `Δ = (1 - rate / median) × 100` on each listing. Positive
+  means priced below the baseline.
+- **`alert_threshold()`** — collects listings where `Δ ≥ arbitrage_threshold_pct` and dispatches
+  them. The email carries the rate, baseline, confidence tag, delta, projected annual rent, size
+  range and listing link.
 
-Annual rent is projected in the scraper as `rate × sf_min`. **Decision recorded:** for a listing
-advertised as a size range, the *minimum* size is used, because the result is tested against a
-budget ceiling — `sf_max` would overstate the commitment and wrongly exclude listings.
+## Scope decisions
 
-### Config not yet consumed
+These are settled choices, not outstanding work.
 
-`config.yaml` defines these, but no module reads them yet: the whole `browser` section (paths are
-module constants in `browserManager.py`) and the whole `smtp` section.
+**One baseline per search, not per ZIP.** The original spec grouped rates by ZIP code to build a
+submarket median. That was dropped: a single search returns too few listings per ZIP for a median to
+mean anything, and a ZIP holding one listing yields a median equal to its own rate, making `Δ = 0`
+by construction. The search-wide median with a `HIGH`/`LOW` sample-size tag conveys the same caution
+more honestly. Nothing location-related is collected or grouped on.
 
-## Next steps, in order
+**No pagination.** Only the first page of results is scraped. Each page turn costs a full Chrome
+relaunch (~25s), and one page is a large enough sample for the baseline.
 
-**1. Fix card scoping in `scrape_listing_cards()` — corrupts the annual rent projection.**
-The size locator is `//ul[contains(@class,'data-points')]` with no leading `.`, so it searches the
-whole document and every card receives the **first** card's size. Prices and URLs are correct, so
-the output looks plausible, but `annual_total_rent_projection` is wrong for all but one listing.
-The locator needs `.//ul[...]`.
+**No `Listing` dataclass.** Cards are dicts. A model would be the right call if the pipeline grew,
+but it would not change behaviour today. One consequence: the rate is parsed from text in three
+separate places rather than once.
 
-**2. Capture ZIP and compute the median per ZIP.**
-`CLAUDE.md` §3.4 specifies a submarket median per ZIP code; today there is one median for the whole
-search. ZIP is free to capture — `card.get_attribute("gtm-listing-zip")`, no text parsing. Apply the
-`HIGH`/`LOW` confidence tag per ZIP too: a ZIP with a single listing has a median equal to its own
-rate, so `Δ = 0` by construction.
+## Known issues
 
-**3. Complete the alert condition.**
-`alert_threshold()` checks the delta only. The spec requires all three:
-`Δ ≥ arbitrage_threshold_pct` **and** `SF ≥ min_square_feet` **and**
-`annual_total_rent_projection ≤ max_annual_budget`. The projection is already computed on each card
-but not yet used here.
+**Card scoping — affects the annual rent figure.** In `scrape_listing_cards()` the size locator is
+`//ul[contains(@class,'data-points')]` with no leading dot, so it searches the whole document and
+every card receives the **first** card's size. Prices and URLs are correct, so output looks
+plausible, but `annual_total_rent_projection` and the "Space Available" line in the email are wrong
+for every listing after the first. The fix is one character: `.//ul[...]`.
 
-**4. Guard the no-data and unparseable-rate paths.**
-- `calculate_baseline()` returns `None` for `NO_DATA`, and `calculate_arbitrage_listing()` then
-  divides by it, raising `TypeError`.
-- `float()` on a rate raises on "Negotiable" or a rate range (`$6.00 - $8.00 SF/YR`), both of which
-  LoopNet shows in some markets. Skip and count such listings rather than crashing the run.
-- The confidence tag is returned but not yet acted on; decide whether a `LOW` baseline suppresses
-  alerts.
+**Unguarded rate parsing.** `float()` on the rate text raises on "Negotiable" or a rate range
+(`$6.00 - $8.00 SF/YR`), both of which LoopNet shows in some markets. One such listing aborts the run.
 
-**5. `Listing` model.**
-Replace the dicts with the dataclass from `CLAUDE.md` §2, exposing `total_annual_rent()`. This also
-removes the rate being parsed from text in three separate places (once in the scraper, twice in
-`ValuationEngine`) — parse once, store the float.
+**`NO_DATA` path.** `calculate_baseline()` can return `None`, and `calculate_arbitrage_listing()`
+then divides by it, raising `TypeError`.
 
-**6. `NotificationDispatcher`.**
-Replace the placeholder in `alert_threshold()`. HTML table (title, ZIP, SF, rate, submarket median,
-Δ, annual rent, link) over `smtplib` + TLS, credentials from `.env`.
+**Alert condition is delta-only.** `min_square_feet` and `max_annual_budget` are applied as URL
+filters at search time but are not re-checked against the projected annual rent before alerting.
 
-**7. Verify `max-rent` semantics.**
-It is sent as the annual budget, but LoopNet's units for that parameter are unverified (rate per SF
-vs total). If they differ, the URL silently drops qualifying listings. Compare result counts with and
-without it before trusting the output.
+**Hardcoded recipient.** `src/notificationDispatcher.py` sends to a literal address; `config.yaml`'s
+`smtp` section (server, port, sender, recipient) is unused. `search.max_pages` is likewise leftover
+from the dropped pagination.
 
-## Deferred
+## Possible future work
 
 **Cross-platform support.** `BrowserManager` is Windows-only. `config.yaml` already carries
 `browser.linux.chrome_path` and `profile_dir`; wiring those up plus a `start_new_session=True`
 branch would cover Linux.
 
-**CI on GitHub Actions.** Specified in `CLAUDE.md`, deliberately deferred. A scheduled runner starts
-from a cold, cookie-less profile on an Azure datacenter IP — the combination most reliably rejected
-by the bot-management layer. Headless does not help; it is more detectable, not less. Running
-locally on a schedule is the workable path.
+**CI on GitHub Actions.** Deliberately deferred. A scheduled runner starts from a cold, cookie-less
+profile on an Azure datacenter IP — the combination most reliably rejected by the bot-management
+layer. Headless does not help; it is more detectable, not less. Running locally on a schedule is the
+workable path.

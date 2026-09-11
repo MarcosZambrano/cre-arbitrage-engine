@@ -8,7 +8,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
-from configManager import ConfigManager
+from .configManager import ConfigManager
 
 HOMEPAGE = "https://www.loopnet.com/"
 

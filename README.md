@@ -1,7 +1,7 @@
 # CRE Arbitrage Engine
 
 Automated system for identifying undervalued commercial real estate listings on LoopNet.
-It monitors target submarkets, computes a live median rate per ZIP code, and alerts on listings
+It monitors target submarkets, computes a live median rate per search, and alerts on listings
 priced below a configurable discount threshold.
 
 > **Status: early development.** The browser access layer, configuration and filtered search are

@@ -1,4 +1,5 @@
-from configManager import ConfigManager
+from .configManager import ConfigManager
+from .notificationDispatcher import NotificationDispatcher
 
 import statistics
 import pprint
@@ -34,10 +35,22 @@ class ValuationEngine:
         pprint.pprint(self.listings)
 
     # This function will trigger the function to send an email notification to the user for the great real estate opportunity found in LoopNet.
-    def alert_threshold(self):
+    def alert_threshold(self, baseline, type_of_baseline):
         # print(self.config.arbitrage_threshold_pct)
         # This function will fire the alert to the notification manager if the threshold is surpassed.
+        email_dispatcher = NotificationDispatcher()
+        alerts = []
+        num_appended = 0
         for card in self.listings:
             if card["arbitrage_delta_percentage"] >= self.config.arbitrage_threshold_pct:
-                print("SEND EMAIL WITH NOTIFICATION MANAGER")
+                # print("SEND EMAIL WITH NOTIFICATION MANAGER")
+                alerts.append(card)
+                num_appended += 1
+
+        print(f"Sending {num_appended} commercial real estate price alerts!")
+        email_dispatcher.send_emails(baseline=baseline, type_of_baseline=type_of_baseline, alerts=alerts, location=self.config.location, property_type=self.config.property_type)
+        
+
+
+
         
